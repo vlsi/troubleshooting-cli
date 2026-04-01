@@ -196,6 +196,298 @@ func TestCLIAddFindingBadSession(t *testing.T) {
 	}
 }
 
+func TestCLIAddHypothesis(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	out, err := runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID,
+		"--statement", "DB connection pool exhausted",
+		"--impact", "high",
+		"--confidence", "0.7",
+		"--next-checks", "check pool metrics,review connection limits")
+	if err != nil {
+		t.Fatalf("add-hypothesis failed: %v", err)
+	}
+	var h domain.Hypothesis
+	if err := json.Unmarshal(out, &h); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if h.ID == "" {
+		t.Error("hypothesis ID must not be empty")
+	}
+	if h.Statement != "DB connection pool exhausted" {
+		t.Errorf("statement mismatch: %q", h.Statement)
+	}
+	if h.Status != domain.HypothesisOpen {
+		t.Errorf("expected open status, got %q", h.Status)
+	}
+	if h.Confidence == nil || *h.Confidence != 0.7 {
+		t.Errorf("confidence mismatch: %v", h.Confidence)
+	}
+	if h.Impact != "high" {
+		t.Errorf("impact mismatch: %q", h.Impact)
+	}
+	if len(h.NextChecks) != 2 {
+		t.Errorf("expected 2 next checks, got %d", len(h.NextChecks))
+	}
+}
+
+func TestCLIAddHypothesisNoConfidence(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	out, err := runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID,
+		"--statement", "memory leak")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var h domain.Hypothesis
+	json.Unmarshal(out, &h)
+	if h.Confidence != nil {
+		t.Errorf("expected nil confidence when not provided, got %v", *h.Confidence)
+	}
+}
+
+func TestCLIAddHypothesisBadSession(t *testing.T) {
+	db := testDB(t)
+	_, err := runCLI(t, db, "session", "add-hypothesis",
+		"--session", "nonexistent",
+		"--statement", "something")
+	if err == nil {
+		t.Error("expected error for nonexistent session")
+	}
+}
+
+func TestCLIUpdateHypothesis(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	// Add a finding to link
+	out, _ = runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID, "--summary", "high latency")
+	var finding domain.Finding
+	json.Unmarshal(out, &finding)
+
+	// Add hypothesis
+	out, _ = runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "pool exhaustion")
+	var h domain.Hypothesis
+	json.Unmarshal(out, &h)
+
+	// Update: change status, add confidence, link finding
+	out, err := runCLI(t, db, "session", "update-hypothesis",
+		"--id", h.ID,
+		"--status", "supported",
+		"--confidence", "0.85",
+		"--support", finding.ID,
+		"--next-checks", "check pool size")
+	if err != nil {
+		t.Fatalf("update-hypothesis failed: %v", err)
+	}
+	var updated domain.Hypothesis
+	if err := json.Unmarshal(out, &updated); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if updated.Status != domain.HypothesisSupported {
+		t.Errorf("expected supported, got %q", updated.Status)
+	}
+	if updated.Confidence == nil || *updated.Confidence != 0.85 {
+		t.Error("confidence not updated")
+	}
+	if len(updated.SupportingFindingIDs) != 1 || updated.SupportingFindingIDs[0] != finding.ID {
+		t.Errorf("supporting findings mismatch: %v", updated.SupportingFindingIDs)
+	}
+	if len(updated.NextChecks) != 1 {
+		t.Errorf("expected 1 next check, got %d", len(updated.NextChecks))
+	}
+}
+
+func TestCLIUpdateHypothesisContradicting(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	out, _ = runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "test hyp")
+	var h domain.Hypothesis
+	json.Unmarshal(out, &h)
+
+	out, err := runCLI(t, db, "session", "update-hypothesis",
+		"--id", h.ID,
+		"--status", "contradicted",
+		"--contradict", "f1,f2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	json.Unmarshal(out, &h)
+	if h.Status != domain.HypothesisContradicted {
+		t.Errorf("expected contradicted, got %q", h.Status)
+	}
+	if len(h.ContradictingFindingIDs) != 2 {
+		t.Errorf("expected 2 contradicting findings, got %d", len(h.ContradictingFindingIDs))
+	}
+}
+
+func TestCLIUpdateHypothesisNotFound(t *testing.T) {
+	db := testDB(t)
+	_, err := runCLI(t, db, "session", "update-hypothesis",
+		"--id", "nonexistent", "--status", "supported")
+	if err == nil {
+		t.Error("expected error for nonexistent hypothesis")
+	}
+}
+
+func TestCLIRankHypotheses(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	// Add hypotheses with different confidences
+	out, _ = runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "low confidence", "--confidence", "0.2")
+	var hLow domain.Hypothesis
+	json.Unmarshal(out, &hLow)
+
+	out, _ = runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "high confidence", "--confidence", "0.9")
+	var hHigh domain.Hypothesis
+	json.Unmarshal(out, &hHigh)
+
+	out, _ = runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "supported one", "--confidence", "0.6")
+	var hSup domain.Hypothesis
+	json.Unmarshal(out, &hSup)
+
+	// Mark one as supported (rank priority 0, above open which is 1)
+	runCLI(t, db, "session", "update-hypothesis",
+		"--id", hSup.ID, "--status", "supported")
+
+	// Rank
+	out, err := runCLI(t, db, "session", "rank-hypotheses", "--session", sess.ID)
+	if err != nil {
+		t.Fatalf("rank failed: %v", err)
+	}
+	var ranked []domain.Hypothesis
+	if err := json.Unmarshal(out, &ranked); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if len(ranked) != 3 {
+		t.Fatalf("expected 3 hypotheses, got %d", len(ranked))
+	}
+	// Supported first, then open by descending confidence
+	if ranked[0].ID != hSup.ID {
+		t.Errorf("rank 0: expected supported, got %q (status=%s)", ranked[0].Statement, ranked[0].Status)
+	}
+	if ranked[1].ID != hHigh.ID {
+		t.Errorf("rank 1: expected high confidence open, got %q", ranked[1].Statement)
+	}
+	if ranked[2].ID != hLow.ID {
+		t.Errorf("rank 2: expected low confidence open, got %q", ranked[2].Statement)
+	}
+}
+
+func TestCLIRankHypothesesEmpty(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	out, err := runCLI(t, db, "session", "rank-hypotheses", "--session", sess.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Empty array or null is fine
+	var ranked []domain.Hypothesis
+	json.Unmarshal(out, &ranked)
+	if len(ranked) != 0 {
+		t.Errorf("expected 0 hypotheses, got %d", len(ranked))
+	}
+}
+
+func TestCLIHypothesisFullFlow(t *testing.T) {
+	db := testDB(t)
+
+	// Start session, add findings, add hypotheses, update, rank
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "OOM investigation", "--service", "worker", "--env", "prod")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	// Add findings
+	out, _ = runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID, "--summary", "RSS growing over time", "--importance", "high")
+	var f1 domain.Finding
+	json.Unmarshal(out, &f1)
+
+	out, _ = runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID, "--summary", "goroutine count stable")
+	var f2 domain.Finding
+	json.Unmarshal(out, &f2)
+
+	// Add hypotheses
+	out, _ = runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "memory leak in handler",
+		"--confidence", "0.8", "--next-checks", "heap profile")
+	var h1 domain.Hypothesis
+	json.Unmarshal(out, &h1)
+
+	out, _ = runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "goroutine leak",
+		"--confidence", "0.3")
+	var h2 domain.Hypothesis
+	json.Unmarshal(out, &h2)
+
+	// Update: support h1 with f1, contradict h2 with f2
+	runCLI(t, db, "session", "update-hypothesis",
+		"--id", h1.ID, "--status", "supported", "--support", f1.ID)
+	runCLI(t, db, "session", "update-hypothesis",
+		"--id", h2.ID, "--status", "contradicted", "--contradict", f2.ID)
+
+	// Rank: supported > contradicted
+	out, err := runCLI(t, db, "session", "rank-hypotheses", "--session", sess.ID)
+	if err != nil {
+		t.Fatalf("rank: %v", err)
+	}
+	var ranked []domain.Hypothesis
+	json.Unmarshal(out, &ranked)
+	if len(ranked) != 2 {
+		t.Fatalf("expected 2, got %d", len(ranked))
+	}
+	if ranked[0].ID != h1.ID {
+		t.Error("expected supported hypothesis first")
+	}
+	if ranked[1].ID != h2.ID {
+		t.Error("expected contradicted hypothesis second")
+	}
+
+	// Verify state includes everything
+	out, _ = runCLI(t, db, "session", "get-state", "--id", sess.ID)
+	var state domain.SessionState
+	json.Unmarshal(out, &state)
+	if len(state.Findings) != 2 {
+		t.Errorf("expected 2 findings, got %d", len(state.Findings))
+	}
+	if len(state.Hypotheses) != 2 {
+		t.Errorf("expected 2 hypotheses, got %d", len(state.Hypotheses))
+	}
+}
+
 func TestCLIFullSliceFlow(t *testing.T) {
 	db := testDB(t)
 

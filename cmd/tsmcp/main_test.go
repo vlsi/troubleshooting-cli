@@ -237,6 +237,307 @@ func TestMCPAddFindingBadSession(t *testing.T) {
 	}
 }
 
+func TestMCPAddHypothesis(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id":  sess.ID,
+		"statement":   "DB pool exhausted",
+		"impact":      "high",
+		"confidence":  0.75,
+		"next_checks": []string{"check pool metrics", "review limits"},
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var h domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &h)
+	if h.ID == "" {
+		t.Error("hypothesis ID must not be empty")
+	}
+	if h.Statement != "DB pool exhausted" {
+		t.Errorf("statement mismatch: %q", h.Statement)
+	}
+	if h.Status != domain.HypothesisOpen {
+		t.Errorf("expected open, got %q", h.Status)
+	}
+	if h.Confidence == nil || *h.Confidence != 0.75 {
+		t.Error("confidence mismatch")
+	}
+	if len(h.NextChecks) != 2 {
+		t.Errorf("expected 2 next checks, got %d", len(h.NextChecks))
+	}
+}
+
+func TestMCPAddHypothesisBadSession(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": "nonexistent",
+		"statement":  "something",
+	})
+	result := resp.Result.(map[string]any)
+	if isErr, ok := result["isError"]; !ok || isErr != true {
+		t.Error("expected isError=true")
+	}
+}
+
+func TestMCPUpdateHypothesis(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// Add finding + hypothesis
+	resp = toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "observation", "summary": "high latency",
+	})
+	var f domain.Finding
+	json.Unmarshal([]byte(extractContent(t, resp)), &f)
+
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "pool issue",
+	})
+	var h domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &h)
+
+	// Update
+	supported := "supported"
+	resp = toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id":                     h.ID,
+		"status":                 supported,
+		"confidence":             0.9,
+		"supporting_finding_ids": []string{f.ID},
+		"next_checks":            []string{"verify fix"},
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var updated domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &updated)
+	if updated.Status != domain.HypothesisSupported {
+		t.Errorf("expected supported, got %q", updated.Status)
+	}
+	if updated.Confidence == nil || *updated.Confidence != 0.9 {
+		t.Error("confidence not updated")
+	}
+	if len(updated.SupportingFindingIDs) != 1 || updated.SupportingFindingIDs[0] != f.ID {
+		t.Errorf("supporting findings mismatch: %v", updated.SupportingFindingIDs)
+	}
+	if len(updated.NextChecks) != 1 {
+		t.Errorf("expected 1 next check, got %d", len(updated.NextChecks))
+	}
+}
+
+func TestMCPUpdateHypothesisContradicting(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "goroutine leak",
+	})
+	var h domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &h)
+
+	resp = toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id":                        h.ID,
+		"status":                    "contradicted",
+		"contradicting_finding_ids": []string{"f1", "f2"},
+	})
+	var updated domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &updated)
+	if updated.Status != domain.HypothesisContradicted {
+		t.Errorf("expected contradicted, got %q", updated.Status)
+	}
+	if len(updated.ContradictingFindingIDs) != 2 {
+		t.Errorf("expected 2 contradicting, got %d", len(updated.ContradictingFindingIDs))
+	}
+}
+
+func TestMCPUpdateHypothesisNotFound(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id":     "nonexistent",
+		"status": "supported",
+	})
+	result := resp.Result.(map[string]any)
+	if isErr, ok := result["isError"]; !ok || isErr != true {
+		t.Error("expected isError=true")
+	}
+}
+
+func TestMCPRankHypotheses(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// Add 3 hypotheses
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "low conf open", "confidence": 0.2,
+	})
+	var hLow domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &hLow)
+
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "high conf open", "confidence": 0.9,
+	})
+	var hHigh domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &hHigh)
+
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "supported", "confidence": 0.5,
+	})
+	var hSup domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &hSup)
+
+	// Mark one supported
+	toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id": hSup.ID, "status": "supported",
+	})
+
+	// Rank
+	resp = toolCall(t, srv, "session_rank_hypotheses", map[string]any{
+		"session_id": sess.ID,
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var ranked []domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &ranked)
+	if len(ranked) != 3 {
+		t.Fatalf("expected 3, got %d", len(ranked))
+	}
+	// supported first, then open by confidence desc
+	if ranked[0].ID != hSup.ID {
+		t.Errorf("rank 0: expected supported, got %q (status=%s)", ranked[0].Statement, ranked[0].Status)
+	}
+	if ranked[1].ID != hHigh.ID {
+		t.Errorf("rank 1: expected high conf open, got %q", ranked[1].Statement)
+	}
+	if ranked[2].ID != hLow.ID {
+		t.Errorf("rank 2: expected low conf open, got %q", ranked[2].Statement)
+	}
+}
+
+func TestMCPRankHypothesesEmpty(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	resp = toolCall(t, srv, "session_rank_hypotheses", map[string]any{
+		"session_id": sess.ID,
+	})
+	var ranked []domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &ranked)
+	if len(ranked) != 0 {
+		t.Errorf("expected 0, got %d", len(ranked))
+	}
+}
+
+func TestMCPHypothesisFullFlow(t *testing.T) {
+	srv := testServer(t)
+
+	// Start session
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "OOM investigation", "service": "worker", "environment": "prod",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// Add findings
+	resp = toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "observation",
+		"summary": "RSS growing", "importance": "high",
+	})
+	var f1 domain.Finding
+	json.Unmarshal([]byte(extractContent(t, resp)), &f1)
+
+	resp = toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "observation",
+		"summary": "goroutine count stable",
+	})
+	var f2 domain.Finding
+	json.Unmarshal([]byte(extractContent(t, resp)), &f2)
+
+	// Add hypotheses
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "memory leak in handler",
+		"confidence": 0.8, "next_checks": []string{"heap profile"},
+	})
+	var h1 domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &h1)
+
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "goroutine leak",
+		"confidence": 0.3,
+	})
+	var h2 domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &h2)
+
+	// Update hypotheses with evidence links
+	toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id": h1.ID, "status": "supported",
+		"supporting_finding_ids": []string{f1.ID},
+	})
+	toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id": h2.ID, "status": "contradicted",
+		"contradicting_finding_ids": []string{f2.ID},
+	})
+
+	// Rank: supported should be first
+	resp = toolCall(t, srv, "session_rank_hypotheses", map[string]any{
+		"session_id": sess.ID,
+	})
+	var ranked []domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &ranked)
+	if len(ranked) != 2 {
+		t.Fatalf("expected 2, got %d", len(ranked))
+	}
+	if ranked[0].ID != h1.ID {
+		t.Error("expected supported hypothesis first")
+	}
+	if len(ranked[0].SupportingFindingIDs) != 1 {
+		t.Error("expected supporting finding linked")
+	}
+	if ranked[1].ID != h2.ID {
+		t.Error("expected contradicted hypothesis second")
+	}
+	if len(ranked[1].ContradictingFindingIDs) != 1 {
+		t.Error("expected contradicting finding linked")
+	}
+
+	// Verify get-state has everything
+	resp = toolCall(t, srv, "session_get_state", map[string]any{"session_id": sess.ID})
+	var state domain.SessionState
+	json.Unmarshal([]byte(extractContent(t, resp)), &state)
+	if len(state.Findings) != 2 {
+		t.Errorf("expected 2 findings, got %d", len(state.Findings))
+	}
+	if len(state.Hypotheses) != 2 {
+		t.Errorf("expected 2 hypotheses, got %d", len(state.Hypotheses))
+	}
+	// session_started + 2 findings + 2 hypotheses + 2 updates = 7
+	if len(state.Timeline) < 7 {
+		t.Errorf("expected >=7 timeline events, got %d", len(state.Timeline))
+	}
+}
+
 func TestMCPFullSliceFlow(t *testing.T) {
 	srv := testServer(t)
 

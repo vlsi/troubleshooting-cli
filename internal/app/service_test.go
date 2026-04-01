@@ -175,6 +175,146 @@ func TestAddFindingAndGetState(t *testing.T) {
 	}
 }
 
+func TestAddHypothesisValidation(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+
+	_, err := svc.AddHypothesis("", "statement", "", nil, nil)
+	if err == nil {
+		t.Error("expected error for empty session_id")
+	}
+	_, err = svc.AddHypothesis(sess.ID, "", "", nil, nil)
+	if err == nil {
+		t.Error("expected error for empty statement")
+	}
+	bad := 1.5
+	_, err = svc.AddHypothesis(sess.ID, "test", "", &bad, nil)
+	if err == nil {
+		t.Error("expected error for confidence > 1.0")
+	}
+	neg := -0.1
+	_, err = svc.AddHypothesis(sess.ID, "test", "", &neg, nil)
+	if err == nil {
+		t.Error("expected error for confidence < 0.0")
+	}
+	_, err = svc.AddHypothesis("nonexistent", "test", "", nil, nil)
+	if err == nil {
+		t.Error("expected error for nonexistent session")
+	}
+}
+
+func TestUpdateHypothesisValidation(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	h, _ := svc.AddHypothesis(sess.ID, "test", "", nil, nil)
+
+	_, err := svc.UpdateHypothesis("", nil, nil, nil, nil, nil)
+	if err == nil {
+		t.Error("expected error for empty id")
+	}
+	badStatus := domain.HypothesisStatus("bogus")
+	_, err = svc.UpdateHypothesis(h.ID, &badStatus, nil, nil, nil, nil)
+	if err == nil {
+		t.Error("expected error for invalid status")
+	}
+	bad := 2.0
+	_, err = svc.UpdateHypothesis(h.ID, nil, &bad, nil, nil, nil)
+	if err == nil {
+		t.Error("expected error for confidence > 1.0")
+	}
+	_, err = svc.UpdateHypothesis("nonexistent", nil, nil, nil, nil, nil)
+	if err == nil {
+		t.Error("expected error for nonexistent hypothesis")
+	}
+}
+
+func TestRankHypothesesByStatusThenConfidence(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+
+	c30 := 0.3
+	c90 := 0.9
+	c50 := 0.5
+
+	// Add hypotheses with different statuses and confidences
+	hOpen, _ := svc.AddHypothesis(sess.ID, "open low", "", &c30, nil)
+	hSupported, _ := svc.AddHypothesis(sess.ID, "supported high", "", &c90, nil)
+	hContradicted, _ := svc.AddHypothesis(sess.ID, "contradicted", "", &c50, nil)
+	hRejected, _ := svc.AddHypothesis(sess.ID, "rejected", "", &c90, nil)
+	hOpenHigh, _ := svc.AddHypothesis(sess.ID, "open high", "", &c90, nil)
+
+	// Update statuses
+	supported := domain.HypothesisSupported
+	contradicted := domain.HypothesisContradicted
+	rejected := domain.HypothesisRejected
+	svc.UpdateHypothesis(hSupported.ID, &supported, nil, nil, nil, nil)
+	svc.UpdateHypothesis(hContradicted.ID, &contradicted, nil, nil, nil, nil)
+	svc.UpdateHypothesis(hRejected.ID, &rejected, nil, nil, nil, nil)
+
+	ranked, err := svc.RankHypotheses(sess.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ranked) != 5 {
+		t.Fatalf("expected 5 hypotheses, got %d", len(ranked))
+	}
+
+	// Expected order: supported(0) > open(1) > contradicted(2) > confirmed(3) > rejected(4)
+	// Within same status, higher confidence first
+	if ranked[0].ID != hSupported.ID {
+		t.Errorf("rank 0: expected supported, got %q (status=%s)", ranked[0].Statement, ranked[0].Status)
+	}
+	// Two open hypotheses: high confidence first
+	if ranked[1].ID != hOpenHigh.ID {
+		t.Errorf("rank 1: expected open high, got %q", ranked[1].Statement)
+	}
+	if ranked[2].ID != hOpen.ID {
+		t.Errorf("rank 2: expected open low, got %q", ranked[2].Statement)
+	}
+	if ranked[3].ID != hContradicted.ID {
+		t.Errorf("rank 3: expected contradicted, got %q", ranked[3].Statement)
+	}
+	if ranked[4].ID != hRejected.ID {
+		t.Errorf("rank 4: expected rejected, got %q", ranked[4].Statement)
+	}
+}
+
+func TestRankHypothesesEmpty(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	ranked, err := svc.RankHypotheses(sess.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ranked) != 0 {
+		t.Errorf("expected 0 hypotheses, got %d", len(ranked))
+	}
+}
+
+func TestUpdateHypothesisAccumulatesFindings(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	h, _ := svc.AddHypothesis(sess.ID, "test", "", nil, nil)
+
+	// First update adds f1
+	h, _ = svc.UpdateHypothesis(h.ID, nil, nil, []string{"f1"}, []string{"f2"}, nil)
+	if len(h.SupportingFindingIDs) != 1 || h.SupportingFindingIDs[0] != "f1" {
+		t.Errorf("expected [f1], got %v", h.SupportingFindingIDs)
+	}
+	if len(h.ContradictingFindingIDs) != 1 || h.ContradictingFindingIDs[0] != "f2" {
+		t.Errorf("expected [f2], got %v", h.ContradictingFindingIDs)
+	}
+
+	// Second update appends f3
+	h, _ = svc.UpdateHypothesis(h.ID, nil, nil, []string{"f3"}, nil, []string{"check logs"})
+	if len(h.SupportingFindingIDs) != 2 {
+		t.Errorf("expected 2 supporting findings, got %d", len(h.SupportingFindingIDs))
+	}
+	if len(h.NextChecks) != 1 || h.NextChecks[0] != "check logs" {
+		t.Errorf("expected [check logs], got %v", h.NextChecks)
+	}
+}
+
 func TestHypothesisLifecycle(t *testing.T) {
 	svc := setup()
 	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)

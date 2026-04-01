@@ -122,6 +122,15 @@ func (s *Service) AddFinding(sessionID, kind, summary, details, importance strin
 
 // AddHypothesis adds a hypothesis to a session.
 func (s *Service) AddHypothesis(sessionID, statement, impact string, confidence *float64, nextChecks []string) (domain.Hypothesis, error) {
+	if sessionID == "" {
+		return domain.Hypothesis{}, fmt.Errorf("session_id is required")
+	}
+	if statement == "" {
+		return domain.Hypothesis{}, fmt.Errorf("statement is required")
+	}
+	if confidence != nil && (*confidence < 0 || *confidence > 1) {
+		return domain.Hypothesis{}, fmt.Errorf("confidence must be between 0.0 and 1.0")
+	}
 	if _, err := s.store.GetSession(sessionID); err != nil {
 		return domain.Hypothesis{}, fmt.Errorf("session not found: %w", err)
 	}
@@ -146,6 +155,22 @@ func (s *Service) AddHypothesis(sessionID, statement, impact string, confidence 
 
 // UpdateHypothesis updates hypothesis status, confidence, linked findings, and next checks.
 func (s *Service) UpdateHypothesis(id string, status *domain.HypothesisStatus, confidence *float64, supportIDs, contradictIDs, nextChecks []string) (domain.Hypothesis, error) {
+	if id == "" {
+		return domain.Hypothesis{}, fmt.Errorf("hypothesis id is required")
+	}
+	if status != nil {
+		valid := map[domain.HypothesisStatus]bool{
+			domain.HypothesisOpen: true, domain.HypothesisSupported: true,
+			domain.HypothesisContradicted: true, domain.HypothesisConfirmed: true,
+			domain.HypothesisRejected: true,
+		}
+		if !valid[*status] {
+			return domain.Hypothesis{}, fmt.Errorf("invalid status %q", *status)
+		}
+	}
+	if confidence != nil && (*confidence < 0 || *confidence > 1) {
+		return domain.Hypothesis{}, fmt.Errorf("confidence must be between 0.0 and 1.0")
+	}
 	h, err := s.store.GetHypothesis(id)
 	if err != nil {
 		return domain.Hypothesis{}, fmt.Errorf("hypothesis not found: %w", err)
