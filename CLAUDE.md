@@ -1,0 +1,1 @@
+/Users/vlsi/Documents/code/troubleshooting/troubleshooting-cli/AGENTS.md
