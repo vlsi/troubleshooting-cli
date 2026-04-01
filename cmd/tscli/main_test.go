@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/vlsi/troubleshooting-cli/internal/domain"
@@ -485,6 +486,217 @@ func TestCLIHypothesisFullFlow(t *testing.T) {
 	}
 	if len(state.Hypotheses) != 2 {
 		t.Errorf("expected 2 hypotheses, got %d", len(state.Hypotheses))
+	}
+}
+
+func TestCLIRecommendNextStep(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	// Add a finding so "gather findings" recommendation doesn't appear
+	runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID, "--summary", "baseline observation")
+
+	// Add hypothesis with next checks
+	runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID,
+		"--statement", "pool exhaustion",
+		"--next-checks", "check pool metrics,review connection limits")
+
+	out, err := runCLI(t, db, "session", "recommend-next-step", "--session", sess.ID)
+	if err != nil {
+		t.Fatalf("recommend failed: %v", err)
+	}
+	var recs []domain.Recommendation
+	if err := json.Unmarshal(out, &recs); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 recommendations, got %d", len(recs))
+	}
+	if recs[0].Action != "check pool metrics" {
+		t.Errorf("unexpected action: %q", recs[0].Action)
+	}
+	if recs[0].Reason == "" {
+		t.Error("reason must not be empty")
+	}
+	if recs[0].Goal == "" {
+		t.Error("goal must not be empty")
+	}
+}
+
+func TestCLIRecommendNextStepLimit(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "h1",
+		"--next-checks", "a,b,c,d,e")
+
+	out, err := runCLI(t, db, "session", "recommend-next-step",
+		"--session", sess.ID, "-n", "2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var recs []domain.Recommendation
+	json.Unmarshal(out, &recs)
+	if len(recs) != 2 {
+		t.Errorf("expected 2 recommendations with -n 2, got %d", len(recs))
+	}
+}
+
+func TestCLIRecommendNoFindings(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	out, err := runCLI(t, db, "session", "recommend-next-step", "--session", sess.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var recs []domain.Recommendation
+	json.Unmarshal(out, &recs)
+	if len(recs) == 0 {
+		t.Fatal("expected at least one recommendation")
+	}
+	// Should suggest gathering findings
+	found := false
+	for _, r := range recs {
+		if strings.Contains(r.Action, "findings") || strings.Contains(r.Action, "logs") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected recommendation to gather findings, got %v", recs)
+	}
+}
+
+func TestCLIGenerateSummaryHandoff(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "latency spike", "--service", "api-gw", "--env", "prod",
+		"--incident", "INC-99")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	// Add finding with evidence
+	runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID,
+		"--kind", "observation",
+		"--summary", "p99 at 2.3s",
+		"--details", "Started at 14:30 UTC",
+		"--importance", "high",
+		"--evidence", `[{"type":"log","pointer":"/var/log/api.log","snippet":"timeout"}]`)
+
+	// Add hypothesis with next check
+	runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID,
+		"--statement", "upstream DB slow",
+		"--confidence", "0.7",
+		"--next-checks", "check DB query latency")
+
+	// Generate handoff summary — outputs raw text, not JSON
+	out, err := runCLI(t, db, "session", "generate-summary",
+		"--session", sess.ID, "--mode", "handoff")
+	if err != nil {
+		t.Fatalf("generate-summary failed: %v", err)
+	}
+	md := string(out)
+	if !strings.Contains(md, "# Handoff: latency spike") {
+		t.Error("expected handoff header")
+	}
+	if !strings.Contains(md, "INC-99") {
+		t.Error("expected incident hint")
+	}
+	if !strings.Contains(md, "p99 at 2.3s") {
+		t.Error("expected finding")
+	}
+	if !strings.Contains(md, "Started at 14:30") {
+		t.Error("expected finding details")
+	}
+	if !strings.Contains(md, "/var/log/api.log") {
+		t.Error("expected evidence pointer")
+	}
+	if !strings.Contains(md, "upstream DB slow") {
+		t.Error("expected hypothesis")
+	}
+	if !strings.Contains(md, "70%") {
+		t.Error("expected confidence")
+	}
+	if !strings.Contains(md, "Recommended Next Steps") {
+		t.Error("expected next steps in handoff")
+	}
+	if !strings.Contains(md, "check DB query latency") {
+		t.Error("expected next check in recommendations")
+	}
+}
+
+func TestCLIGenerateSummaryPostmortem(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "outage", "--service", "payments", "--env", "prod")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID, "--summary", "circuit breaker tripped")
+	runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "downstream timeout")
+
+	// Close session
+	runCLI(t, db, "session", "close",
+		"--session", sess.ID, "--status", "resolved", "--outcome", "increased timeout")
+
+	out, err := runCLI(t, db, "session", "generate-summary",
+		"--session", sess.ID, "--mode", "postmortem-draft")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	md := string(out)
+	if !strings.Contains(md, "# Postmortem Draft: outage") {
+		t.Error("expected postmortem header")
+	}
+	if !strings.Contains(md, "resolved") {
+		t.Error("expected resolved status")
+	}
+	if !strings.Contains(md, "increased timeout") {
+		t.Error("expected outcome")
+	}
+	if !strings.Contains(md, "## Timeline") {
+		t.Error("expected timeline in postmortem")
+	}
+	if !strings.Contains(md, "session_started") {
+		t.Error("expected session_started event in timeline")
+	}
+	if strings.Contains(md, "Recommended Next Steps") {
+		t.Error("postmortem should not include next steps")
+	}
+}
+
+func TestCLIGenerateSummaryDefaultMode(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	// Default mode (no --mode flag)
+	out, err := runCLI(t, db, "session", "generate-summary",
+		"--session", sess.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	md := string(out)
+	if !strings.Contains(md, "# Handoff:") {
+		t.Error("expected default mode to produce handoff summary")
 	}
 }
 

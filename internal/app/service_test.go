@@ -364,9 +364,10 @@ func TestRankHypotheses(t *testing.T) {
 	}
 }
 
-func TestRecommendNextSteps(t *testing.T) {
+func TestRecommendNextStepsFromChecks(t *testing.T) {
 	svc := setup()
 	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.AddFinding(sess.ID, "observation", "something observed", "", "", nil, nil)
 	svc.AddHypothesis(sess.ID, "pool exhaustion", "", nil, []string{"check connection count", "review pool config"})
 
 	recs, err := svc.RecommendNextSteps(sess.ID, 3)
@@ -379,26 +380,232 @@ func TestRecommendNextSteps(t *testing.T) {
 	if recs[0].Action != "check connection count" {
 		t.Error("unexpected first recommendation")
 	}
+	if !strings.Contains(recs[0].Reason, "pool exhaustion") {
+		t.Error("reason should reference the hypothesis")
+	}
+	if !strings.Contains(recs[0].Goal, "pool exhaustion") {
+		t.Error("goal should reference the hypothesis")
+	}
 }
 
-func TestGenerateSummary(t *testing.T) {
+func TestRecommendSkipsConfirmedAndRejected(t *testing.T) {
 	svc := setup()
-	sess, _ := svc.StartSession("pod crash", "api-gw", "prod", "", nil)
-	svc.AddFinding(sess.ID, "observation", "OOM kill", "", "high", nil, nil)
-	svc.AddHypothesis(sess.ID, "memory leak in handler", "", nil, nil)
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	h1, _ := svc.AddHypothesis(sess.ID, "confirmed one", "", nil, []string{"should not appear"})
+	h2, _ := svc.AddHypothesis(sess.ID, "rejected one", "", nil, []string{"should not appear either"})
+	svc.AddHypothesis(sess.ID, "open one", "", nil, []string{"should appear"})
+
+	confirmed := domain.HypothesisConfirmed
+	rejected := domain.HypothesisRejected
+	svc.UpdateHypothesis(h1.ID, &confirmed, nil, nil, nil, nil)
+	svc.UpdateHypothesis(h2.ID, &rejected, nil, nil, nil, nil)
+
+	recs, _ := svc.RecommendNextSteps(sess.ID, 10)
+	for _, r := range recs {
+		if strings.Contains(r.Action, "should not appear") {
+			t.Errorf("recommendation from confirmed/rejected hypothesis should be excluded: %q", r.Action)
+		}
+	}
+	if len(recs) < 1 || recs[0].Action != "should appear" {
+		t.Error("expected check from open hypothesis")
+	}
+}
+
+func TestRecommendSuggestsChecksForHypWithoutChecks(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.AddHypothesis(sess.ID, "needs investigation", "", nil, nil)
+
+	recs, _ := svc.RecommendNextSteps(sess.ID, 3)
+	if len(recs) == 0 {
+		t.Fatal("expected at least one recommendation")
+	}
+	if !strings.Contains(recs[0].Action, "Define next checks") {
+		t.Errorf("expected suggestion to define checks, got %q", recs[0].Action)
+	}
+}
+
+func TestRecommendSuggestsHypothesesWhenNone(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.AddFinding(sess.ID, "observation", "high latency", "", "", nil, nil)
+
+	recs, _ := svc.RecommendNextSteps(sess.ID, 3)
+	found := false
+	for _, r := range recs {
+		if strings.Contains(r.Action, "hypotheses") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected recommendation to formulate hypotheses")
+	}
+}
+
+func TestRecommendSuggestsFindingsWhenEmpty(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+
+	recs, _ := svc.RecommendNextSteps(sess.ID, 3)
+	found := false
+	for _, r := range recs {
+		if strings.Contains(r.Action, "findings") || strings.Contains(r.Action, "logs") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected recommendation to gather findings")
+	}
+}
+
+func TestRecommendRespectsLimit(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.AddHypothesis(sess.ID, "h1", "", nil, []string{"a", "b", "c"})
+	svc.AddHypothesis(sess.ID, "h2", "", nil, []string{"d", "e"})
+
+	recs, _ := svc.RecommendNextSteps(sess.ID, 2)
+	if len(recs) != 2 {
+		t.Errorf("expected exactly 2 recommendations, got %d", len(recs))
+	}
+}
+
+func TestRecommendValidation(t *testing.T) {
+	svc := setup()
+	_, err := svc.RecommendNextSteps("", 3)
+	if err == nil {
+		t.Error("expected error for empty session_id")
+	}
+	_, err = svc.RecommendNextSteps("nonexistent", 3)
+	if err == nil {
+		t.Error("expected error for nonexistent session")
+	}
+}
+
+func TestGenerateSummaryHandoff(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("pod crash", "api-gw", "prod", "INC-42", nil)
+	svc.AddFinding(sess.ID, "observation", "OOM kill", "RSS exceeded 2GB", "high", nil,
+		[]domain.Evidence{{Type: domain.EvidenceLog, Pointer: "/var/log/app.log", Snippet: "OOM killed process"}})
+	c := 0.8
+	h, _ := svc.AddHypothesis(sess.ID, "memory leak in handler", "high", &c, []string{"heap profile"})
+	supported := domain.HypothesisSupported
+	svc.UpdateHypothesis(h.ID, &supported, nil, nil, nil, nil)
 
 	md, err := svc.GenerateSummary(sess.ID, "handoff")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(md, "Handoff") {
+	if !strings.Contains(md, "# Handoff:") {
 		t.Error("expected handoff header")
 	}
+	if !strings.Contains(md, "api-gw") {
+		t.Error("expected service in context")
+	}
+	if !strings.Contains(md, "INC-42") {
+		t.Error("expected incident hint in context")
+	}
 	if !strings.Contains(md, "OOM kill") {
-		t.Error("expected finding in summary")
+		t.Error("expected finding summary")
+	}
+	if !strings.Contains(md, "RSS exceeded 2GB") {
+		t.Error("expected finding details")
+	}
+	if !strings.Contains(md, "/var/log/app.log") {
+		t.Error("expected evidence pointer")
+	}
+	if !strings.Contains(md, "OOM killed process") {
+		t.Error("expected evidence snippet")
 	}
 	if !strings.Contains(md, "memory leak") {
-		t.Error("expected hypothesis in summary")
+		t.Error("expected hypothesis")
+	}
+	if !strings.Contains(md, "80%") {
+		t.Error("expected confidence percentage")
+	}
+	if !strings.Contains(md, "Recommended Next Steps") {
+		t.Error("expected next steps section in handoff")
+	}
+	if !strings.Contains(md, "heap profile") {
+		t.Error("expected next check in recommendations")
+	}
+	// handoff should NOT have timeline
+	if strings.Contains(md, "## Timeline") {
+		t.Error("handoff should not include timeline section")
+	}
+}
+
+func TestGenerateSummaryPostmortem(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("pod crash", "api-gw", "prod", "", nil)
+	svc.AddFinding(sess.ID, "observation", "OOM kill", "", "high", nil, nil)
+	svc.AddHypothesis(sess.ID, "memory leak", "", nil, nil)
+	svc.CloseSession(sess.ID, domain.SessionResolved, "fixed memory leak in handler X")
+
+	md, err := svc.GenerateSummary(sess.ID, "postmortem-draft")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(md, "# Postmortem Draft:") {
+		t.Error("expected postmortem header")
+	}
+	if !strings.Contains(md, "resolved") {
+		t.Error("expected resolved status")
+	}
+	if !strings.Contains(md, "fixed memory leak") {
+		t.Error("expected outcome in context")
+	}
+	if !strings.Contains(md, "## Timeline") {
+		t.Error("expected timeline section in postmortem")
+	}
+	if !strings.Contains(md, "session_started") {
+		t.Error("expected session_started in timeline")
+	}
+	// postmortem should NOT have next steps
+	if strings.Contains(md, "Recommended Next Steps") {
+		t.Error("postmortem should not include next steps")
+	}
+}
+
+func TestGenerateSummaryValidation(t *testing.T) {
+	svc := setup()
+	_, err := svc.GenerateSummary("", "handoff")
+	if err == nil {
+		t.Error("expected error for empty session_id")
+	}
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	_, err = svc.GenerateSummary(sess.ID, "bogus")
+	if err == nil {
+		t.Error("expected error for invalid mode")
+	}
+}
+
+func TestGenerateSummaryDefaultMode(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	md, err := svc.GenerateSummary(sess.ID, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(md, "# Handoff:") {
+		t.Error("expected default mode to be handoff")
+	}
+}
+
+func TestGenerateSummaryRecordsTimelineEvent(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.GenerateSummary(sess.ID, "handoff")
+
+	timeline, _ := svc.GetTimeline(sess.ID)
+	found := false
+	for _, e := range timeline {
+		if e.Kind == "summary_generated" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected summary_generated timeline event")
 	}
 }
 

@@ -538,6 +538,264 @@ func TestMCPHypothesisFullFlow(t *testing.T) {
 	}
 }
 
+func TestMCPRecommendNextStep(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// Add a finding so "gather findings" recommendation doesn't appear
+	toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "observation", "summary": "baseline",
+	})
+
+	toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id":  sess.ID,
+		"statement":   "pool exhaustion",
+		"next_checks": []string{"check pool metrics", "review limits"},
+	})
+
+	resp = toolCall(t, srv, "session_recommend_next_step", map[string]any{
+		"session_id": sess.ID,
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var recs []domain.Recommendation
+	json.Unmarshal([]byte(extractContent(t, resp)), &recs)
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 recommendations, got %d", len(recs))
+	}
+	if recs[0].Action != "check pool metrics" {
+		t.Errorf("unexpected action: %q", recs[0].Action)
+	}
+	if recs[0].Reason == "" || recs[0].Goal == "" {
+		t.Error("reason and goal must not be empty")
+	}
+}
+
+func TestMCPRecommendNextStepWithLimit(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id":  sess.ID,
+		"statement":   "h1",
+		"next_checks": []string{"a", "b", "c", "d"},
+	})
+
+	resp = toolCall(t, srv, "session_recommend_next_step", map[string]any{
+		"session_id": sess.ID,
+		"count":      2,
+	})
+	var recs []domain.Recommendation
+	json.Unmarshal([]byte(extractContent(t, resp)), &recs)
+	if len(recs) != 2 {
+		t.Errorf("expected 2 with count=2, got %d", len(recs))
+	}
+}
+
+func TestMCPRecommendNoFindings(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	resp = toolCall(t, srv, "session_recommend_next_step", map[string]any{
+		"session_id": sess.ID,
+	})
+	var recs []domain.Recommendation
+	json.Unmarshal([]byte(extractContent(t, resp)), &recs)
+	if len(recs) == 0 {
+		t.Fatal("expected at least one recommendation")
+	}
+	found := false
+	for _, r := range recs {
+		if strings.Contains(r.Action, "findings") || strings.Contains(r.Action, "logs") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected recommendation to gather findings")
+	}
+}
+
+func TestMCPRecommendSkipsTerminal(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// Add confirmed hypothesis with checks — checks should not appear
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id":  sess.ID,
+		"statement":   "confirmed",
+		"next_checks": []string{"should not appear"},
+	})
+	var h domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &h)
+	toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id": h.ID, "status": "confirmed",
+	})
+
+	// Add open hypothesis with checks — these should appear
+	toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id":  sess.ID,
+		"statement":   "open one",
+		"next_checks": []string{"should appear"},
+	})
+
+	resp = toolCall(t, srv, "session_recommend_next_step", map[string]any{
+		"session_id": sess.ID,
+	})
+	var recs []domain.Recommendation
+	json.Unmarshal([]byte(extractContent(t, resp)), &recs)
+	for _, r := range recs {
+		if r.Action == "should not appear" {
+			t.Error("should not recommend checks from confirmed hypothesis")
+		}
+	}
+	if len(recs) == 0 || recs[0].Action != "should appear" {
+		t.Error("expected check from open hypothesis")
+	}
+}
+
+func TestMCPGenerateSummaryHandoff(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "latency spike", "service": "api-gw", "environment": "prod",
+		"incident_hint": "INC-99",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// Add finding with evidence
+	toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "observation",
+		"summary": "p99 at 2.3s", "details": "Started at 14:30 UTC",
+		"importance": "high",
+		"evidence": []map[string]any{
+			{"type": "log", "pointer": "/var/log/api.log", "snippet": "timeout"},
+		},
+	})
+
+	// Add hypothesis
+	toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "upstream DB slow",
+		"confidence": 0.7, "next_checks": []string{"check DB latency"},
+	})
+
+	resp = toolCall(t, srv, "session_generate_summary", map[string]any{
+		"session_id": sess.ID, "mode": "handoff",
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	// Summary is returned as a string in content text
+	md := extractContent(t, resp)
+	// MCP returns the summary as a JSON string, unwrap it
+	var mdStr string
+	if err := json.Unmarshal([]byte(md), &mdStr); err != nil {
+		mdStr = md // fallback: might be bare text
+	}
+	if !strings.Contains(mdStr, "# Handoff: latency spike") {
+		t.Error("expected handoff header")
+	}
+	if !strings.Contains(mdStr, "INC-99") {
+		t.Error("expected incident hint")
+	}
+	if !strings.Contains(mdStr, "p99 at 2.3s") {
+		t.Error("expected finding")
+	}
+	if !strings.Contains(mdStr, "/var/log/api.log") {
+		t.Error("expected evidence pointer")
+	}
+	if !strings.Contains(mdStr, "upstream DB slow") {
+		t.Error("expected hypothesis")
+	}
+	if !strings.Contains(mdStr, "Recommended Next Steps") {
+		t.Error("expected next steps in handoff")
+	}
+	if !strings.Contains(mdStr, "check DB latency") {
+		t.Error("expected next check in recommendations")
+	}
+}
+
+func TestMCPGenerateSummaryPostmortem(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "outage", "service": "payments", "environment": "prod",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "error", "summary": "circuit breaker tripped",
+	})
+	toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "downstream timeout",
+	})
+	toolCall(t, srv, "session_close", map[string]any{
+		"session_id": sess.ID, "status": "resolved", "outcome": "increased timeout",
+	})
+
+	resp = toolCall(t, srv, "session_generate_summary", map[string]any{
+		"session_id": sess.ID, "mode": "postmortem-draft",
+	})
+	md := extractContent(t, resp)
+	var mdStr string
+	if err := json.Unmarshal([]byte(md), &mdStr); err != nil {
+		mdStr = md
+	}
+	if !strings.Contains(mdStr, "# Postmortem Draft: outage") {
+		t.Error("expected postmortem header")
+	}
+	if !strings.Contains(mdStr, "resolved") {
+		t.Error("expected resolved status")
+	}
+	if !strings.Contains(mdStr, "increased timeout") {
+		t.Error("expected outcome")
+	}
+	if !strings.Contains(mdStr, "## Timeline") {
+		t.Error("expected timeline")
+	}
+	if strings.Contains(mdStr, "Recommended Next Steps") {
+		t.Error("postmortem should not include next steps")
+	}
+}
+
+func TestMCPGenerateSummaryBadSession(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_generate_summary", map[string]any{
+		"session_id": "nonexistent", "mode": "handoff",
+	})
+	result := resp.Result.(map[string]any)
+	if isErr, ok := result["isError"]; !ok || isErr != true {
+		t.Error("expected isError=true")
+	}
+}
+
+func TestMCPRecommendBadSession(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_recommend_next_step", map[string]any{
+		"session_id": "nonexistent",
+	})
+	result := resp.Result.(map[string]any)
+	if isErr, ok := result["isError"]; !ok || isErr != true {
+		t.Error("expected isError=true")
+	}
+}
+
 func TestMCPFullSliceFlow(t *testing.T) {
 	srv := testServer(t)
 

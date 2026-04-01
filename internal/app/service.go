@@ -229,12 +229,32 @@ func (s *Service) RankHypotheses(sessionID string) ([]domain.Hypothesis, error) 
 }
 
 // RecommendNextSteps returns up to n recommended next actions.
+// The logic is deterministic and heuristic:
+//  1. Gather next_checks from ranked hypotheses (skipping confirmed/rejected).
+//  2. For open/supported hypotheses without next_checks, suggest adding checks.
+//  3. If no hypotheses exist, suggest adding hypotheses.
+//  4. If no findings exist, suggest adding findings.
 func (s *Service) RecommendNextSteps(sessionID string, n int) ([]domain.Recommendation, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if n <= 0 {
+		n = 3
+	}
+
+	state, err := s.GetState(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
 	hyps, err := s.RankHypotheses(sessionID)
 	if err != nil {
 		return nil, err
 	}
+
 	var recs []domain.Recommendation
+
+	// Step 1: next_checks from active hypotheses, prioritized by rank order
 	for _, h := range hyps {
 		if h.Status == domain.HypothesisConfirmed || h.Status == domain.HypothesisRejected {
 			continue
@@ -242,21 +262,53 @@ func (s *Service) RecommendNextSteps(sessionID string, n int) ([]domain.Recommen
 		for _, check := range h.NextChecks {
 			recs = append(recs, domain.Recommendation{
 				Action: check,
-				Reason: fmt.Sprintf("Next check for hypothesis: %s (status: %s)", h.Statement, h.Status),
-				Goal:   "Advance investigation of this hypothesis",
+				Reason: fmt.Sprintf("Pending check for hypothesis %q (status: %s)", h.Statement, h.Status),
+				Goal:   fmt.Sprintf("Validate or refute: %s", h.Statement),
 			})
 			if len(recs) >= n {
 				return recs, nil
 			}
 		}
 	}
-	if len(recs) == 0 {
+
+	// Step 2: active hypotheses with no next_checks
+	for _, h := range hyps {
+		if h.Status == domain.HypothesisConfirmed || h.Status == domain.HypothesisRejected {
+			continue
+		}
+		if len(h.NextChecks) == 0 {
+			recs = append(recs, domain.Recommendation{
+				Action: fmt.Sprintf("Define next checks for hypothesis %q", h.Statement),
+				Reason: fmt.Sprintf("Hypothesis %q (status: %s) has no next checks defined", h.Statement, h.Status),
+				Goal:   "Ensure every active hypothesis has a path to validation",
+			})
+			if len(recs) >= n {
+				return recs, nil
+			}
+		}
+	}
+
+	// Step 3: no hypotheses at all
+	if len(hyps) == 0 && len(state.Findings) > 0 {
 		recs = append(recs, domain.Recommendation{
-			Action: "Add more findings or hypotheses to guide the investigation",
-			Reason: "No pending checks found",
-			Goal:   "Expand the investigation scope",
+			Action: "Formulate hypotheses based on existing findings",
+			Reason: fmt.Sprintf("Session has %d finding(s) but no hypotheses", len(state.Findings)),
+			Goal:   "Move from observations to testable explanations",
+		})
+		if len(recs) >= n {
+			return recs, nil
+		}
+	}
+
+	// Step 4: no findings at all
+	if len(state.Findings) == 0 {
+		recs = append(recs, domain.Recommendation{
+			Action: "Gather initial findings: check logs, metrics, and recent changes",
+			Reason: "No findings recorded yet",
+			Goal:   "Establish an evidence baseline for the investigation",
 		})
 	}
+
 	return recs, nil
 }
 
@@ -269,26 +321,50 @@ func (s *Service) GetTimeline(sessionID string) ([]domain.TimelineEvent, error) 
 	return events, nil
 }
 
-// GenerateSummary produces a markdown summary for handoff or postmortem.
+// GenerateSummary produces a markdown summary for handoff or postmortem-draft.
+//
+// Handoff mode includes: context, findings with evidence, hypotheses, and recommended next steps.
+// Postmortem-draft mode includes: context, findings with evidence, hypotheses, outcome, and full timeline.
 func (s *Service) GenerateSummary(sessionID, mode string) (string, error) {
+	if sessionID == "" {
+		return "", fmt.Errorf("session_id is required")
+	}
+	if mode == "" {
+		mode = "handoff"
+	}
+	if mode != "handoff" && mode != "postmortem-draft" {
+		return "", fmt.Errorf("mode must be \"handoff\" or \"postmortem-draft\"")
+	}
+
 	state, err := s.GetState(sessionID)
 	if err != nil {
 		return "", err
 	}
+
 	var b strings.Builder
+
+	// Header
 	switch mode {
 	case "handoff":
 		b.WriteString(fmt.Sprintf("# Handoff: %s\n\n", state.Session.Title))
 	case "postmortem-draft":
 		b.WriteString(fmt.Sprintf("# Postmortem Draft: %s\n\n", state.Session.Title))
-	default:
-		b.WriteString(fmt.Sprintf("# Summary: %s\n\n", state.Session.Title))
 	}
 
-	b.WriteString(fmt.Sprintf("**Service:** %s  \n", state.Session.Service))
-	b.WriteString(fmt.Sprintf("**Environment:** %s  \n", state.Session.Environment))
-	b.WriteString(fmt.Sprintf("**Status:** %s  \n\n", state.Session.Status))
+	// Context
+	b.WriteString("## Context\n\n")
+	b.WriteString(fmt.Sprintf("- **Service:** %s\n", state.Session.Service))
+	b.WriteString(fmt.Sprintf("- **Environment:** %s\n", state.Session.Environment))
+	b.WriteString(fmt.Sprintf("- **Status:** %s\n", state.Session.Status))
+	if state.Session.IncidentHint != "" {
+		b.WriteString(fmt.Sprintf("- **Incident:** %s\n", state.Session.IncidentHint))
+	}
+	if state.Session.Outcome != "" {
+		b.WriteString(fmt.Sprintf("- **Outcome:** %s\n", state.Session.Outcome))
+	}
+	b.WriteString("\n")
 
+	// Findings with evidence
 	if len(state.Findings) > 0 {
 		b.WriteString("## Findings\n\n")
 		for _, f := range state.Findings {
@@ -297,30 +373,64 @@ func (s *Service) GenerateSummary(sessionID, mode string) (string, error) {
 				b.WriteString(fmt.Sprintf(" (importance: %s)", f.Importance))
 			}
 			b.WriteString("\n")
+			if f.Details != "" {
+				b.WriteString(fmt.Sprintf("  - Details: %s\n", f.Details))
+			}
+			for _, ev := range f.EvidenceRefs {
+				b.WriteString(fmt.Sprintf("  - Evidence [%s]: %s", ev.Type, ev.Pointer))
+				if ev.Snippet != "" {
+					b.WriteString(fmt.Sprintf(" — `%s`", ev.Snippet))
+				}
+				b.WriteString("\n")
+			}
 		}
 		b.WriteString("\n")
 	}
 
-	if len(state.Hypotheses) > 0 {
+	// Hypotheses — use ranked order for clarity
+	ranked, _ := s.RankHypotheses(sessionID)
+	if len(ranked) > 0 {
 		b.WriteString("## Hypotheses\n\n")
-		for _, h := range state.Hypotheses {
+		for _, h := range ranked {
 			conf := "unknown"
 			if h.Confidence != nil {
 				conf = fmt.Sprintf("%.0f%%", *h.Confidence*100)
 			}
 			b.WriteString(fmt.Sprintf("- **%s** — status: %s, confidence: %s\n", h.Statement, h.Status, conf))
+			if len(h.SupportingFindingIDs) > 0 {
+				b.WriteString(fmt.Sprintf("  - Supporting evidence: %s\n", strings.Join(h.SupportingFindingIDs, ", ")))
+			}
+			if len(h.ContradictingFindingIDs) > 0 {
+				b.WriteString(fmt.Sprintf("  - Contradicting evidence: %s\n", strings.Join(h.ContradictingFindingIDs, ", ")))
+			}
 		}
 		b.WriteString("\n")
 	}
 
+	// Handoff: include recommended next steps
+	if mode == "handoff" {
+		recs, _ := s.RecommendNextSteps(sessionID, 5)
+		if len(recs) > 0 {
+			b.WriteString("## Recommended Next Steps\n\n")
+			for _, r := range recs {
+				b.WriteString(fmt.Sprintf("- **%s**\n", r.Action))
+				b.WriteString(fmt.Sprintf("  - Why: %s\n", r.Reason))
+				b.WriteString(fmt.Sprintf("  - Goal: %s\n", r.Goal))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	// Postmortem: include timeline
 	if mode == "postmortem-draft" && len(state.Timeline) > 0 {
 		b.WriteString("## Timeline\n\n")
 		for _, e := range state.Timeline {
-			b.WriteString(fmt.Sprintf("- %s — %s: %s\n", e.Timestamp.Format(time.RFC3339), e.Kind, e.Summary))
+			b.WriteString(fmt.Sprintf("- %s — **%s**: %s\n", e.Timestamp.Format(time.RFC3339), e.Kind, e.Summary))
 		}
 		b.WriteString("\n")
 	}
 
+	s.addEvent(sessionID, "summary_generated", fmt.Sprintf("Summary generated: %s", mode), sessionID)
 	return b.String(), nil
 }
 
