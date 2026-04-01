@@ -700,6 +700,184 @@ func TestCLIGenerateSummaryDefaultMode(t *testing.T) {
 	}
 }
 
+func TestCLIGetTimeline(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID, "--summary", "observation A")
+	runCLI(t, db, "session", "add-hypothesis",
+		"--session", sess.ID, "--statement", "hypothesis B")
+
+	out, err := runCLI(t, db, "session", "get-timeline", "--session", sess.ID)
+	if err != nil {
+		t.Fatalf("get-timeline failed: %v", err)
+	}
+	var events []domain.TimelineEvent
+	if err := json.Unmarshal(out, &events); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events, got %d", len(events))
+	}
+	if events[0].Kind != "session_started" {
+		t.Errorf("first event: expected session_started, got %s", events[0].Kind)
+	}
+	if events[1].Kind != "finding_added" {
+		t.Errorf("second event: expected finding_added, got %s", events[1].Kind)
+	}
+	if events[2].Kind != "hypothesis_added" {
+		t.Errorf("third event: expected hypothesis_added, got %s", events[2].Kind)
+	}
+	// Verify fields
+	for _, e := range events {
+		if e.ID == "" {
+			t.Error("event ID must not be empty")
+		}
+		if e.SessionID != sess.ID {
+			t.Error("session ID mismatch")
+		}
+		if e.Summary == "" {
+			t.Error("summary must not be empty")
+		}
+	}
+}
+
+func TestCLIGetTimelineNotFound(t *testing.T) {
+	db := testDB(t)
+	_, err := runCLI(t, db, "session", "get-timeline", "--session", "nonexistent")
+	if err == nil {
+		t.Error("expected error for nonexistent session")
+	}
+}
+
+func TestCLIClose(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	out, err := runCLI(t, db, "session", "close",
+		"--session", sess.ID, "--status", "resolved",
+		"--outcome", "fixed connection pool config")
+	if err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	var closed domain.Session
+	if err := json.Unmarshal(out, &closed); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if closed.Status != domain.SessionResolved {
+		t.Errorf("expected resolved, got %q", closed.Status)
+	}
+	if closed.ClosedAt == nil {
+		t.Error("closed_at must be set")
+	}
+	if closed.Outcome != "fixed connection pool config" {
+		t.Errorf("outcome mismatch: %q", closed.Outcome)
+	}
+}
+
+func TestCLICloseAllStatuses(t *testing.T) {
+	db := testDB(t)
+	for _, status := range []string{"resolved", "mitigated", "abandoned", "needs-followup"} {
+		t.Run(status, func(t *testing.T) {
+			out, _ := runCLI(t, db, "session", "start",
+				"--title", "test-"+status, "--service", "svc", "--env", "dev")
+			var sess domain.Session
+			json.Unmarshal(out, &sess)
+
+			out, err := runCLI(t, db, "session", "close",
+				"--session", sess.ID, "--status", status)
+			if err != nil {
+				t.Fatalf("close with status %s failed: %v", status, err)
+			}
+			var closed domain.Session
+			json.Unmarshal(out, &closed)
+			if string(closed.Status) != status {
+				t.Errorf("expected %s, got %s", status, closed.Status)
+			}
+		})
+	}
+}
+
+func TestCLICloseInvalidStatus(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	_, err := runCLI(t, db, "session", "close",
+		"--session", sess.ID, "--status", "bogus")
+	if err == nil {
+		t.Error("expected error for invalid status")
+	}
+}
+
+func TestCLICloseAlreadyClosed(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "test", "--service", "svc", "--env", "dev")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	runCLI(t, db, "session", "close",
+		"--session", sess.ID, "--status", "resolved")
+
+	_, err := runCLI(t, db, "session", "close",
+		"--session", sess.ID, "--status", "mitigated")
+	if err == nil {
+		t.Error("expected error when closing already-closed session")
+	}
+}
+
+func TestCLICloseNotFound(t *testing.T) {
+	db := testDB(t)
+	_, err := runCLI(t, db, "session", "close",
+		"--session", "nonexistent", "--status", "resolved")
+	if err == nil {
+		t.Error("expected error for nonexistent session")
+	}
+}
+
+func TestCLICloseTimelineAndState(t *testing.T) {
+	db := testDB(t)
+	out, _ := runCLI(t, db, "session", "start",
+		"--title", "investigation", "--service", "api", "--env", "prod")
+	var sess domain.Session
+	json.Unmarshal(out, &sess)
+
+	runCLI(t, db, "session", "add-finding",
+		"--session", sess.ID, "--summary", "found the issue")
+	runCLI(t, db, "session", "close",
+		"--session", sess.ID, "--status", "resolved", "--outcome", "deployed fix")
+
+	// Verify timeline has session_closed
+	out, _ = runCLI(t, db, "session", "get-timeline", "--session", sess.ID)
+	var events []domain.TimelineEvent
+	json.Unmarshal(out, &events)
+	lastEvent := events[len(events)-1]
+	if lastEvent.Kind != "session_closed" {
+		t.Errorf("last event should be session_closed, got %s", lastEvent.Kind)
+	}
+
+	// Verify state reflects closure
+	out, _ = runCLI(t, db, "session", "get-state", "--id", sess.ID)
+	var state domain.SessionState
+	json.Unmarshal(out, &state)
+	if state.Session.Status != domain.SessionResolved {
+		t.Errorf("expected resolved, got %s", state.Session.Status)
+	}
+	if state.Session.Outcome != "deployed fix" {
+		t.Errorf("outcome mismatch: %q", state.Session.Outcome)
+	}
+}
+
 func TestCLIFullSliceFlow(t *testing.T) {
 	db := testDB(t)
 

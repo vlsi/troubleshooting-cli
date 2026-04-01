@@ -796,6 +796,181 @@ func TestMCPRecommendBadSession(t *testing.T) {
 	}
 }
 
+func TestMCPGetTimeline(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "observation", "summary": "finding A",
+	})
+	toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID, "statement": "hypothesis B",
+	})
+
+	resp = toolCall(t, srv, "session_get_timeline", map[string]any{
+		"session_id": sess.ID,
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var events []domain.TimelineEvent
+	json.Unmarshal([]byte(extractContent(t, resp)), &events)
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events, got %d", len(events))
+	}
+	if events[0].Kind != "session_started" {
+		t.Errorf("first: expected session_started, got %s", events[0].Kind)
+	}
+	if events[1].Kind != "finding_added" {
+		t.Errorf("second: expected finding_added, got %s", events[1].Kind)
+	}
+	if events[2].Kind != "hypothesis_added" {
+		t.Errorf("third: expected hypothesis_added, got %s", events[2].Kind)
+	}
+	for _, e := range events {
+		if e.ID == "" || e.SessionID == "" || e.Summary == "" {
+			t.Error("event fields must not be empty")
+		}
+	}
+}
+
+func TestMCPGetTimelineNotFound(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_get_timeline", map[string]any{
+		"session_id": "nonexistent",
+	})
+	result := resp.Result.(map[string]any)
+	if isErr, ok := result["isError"]; !ok || isErr != true {
+		t.Error("expected isError=true")
+	}
+}
+
+func TestMCPClose(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	resp = toolCall(t, srv, "session_close", map[string]any{
+		"session_id": sess.ID,
+		"status":     "resolved",
+		"outcome":    "fixed the config",
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var closed domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &closed)
+	if closed.Status != domain.SessionResolved {
+		t.Errorf("expected resolved, got %q", closed.Status)
+	}
+	if closed.ClosedAt == nil {
+		t.Error("closed_at must be set")
+	}
+	if closed.Outcome != "fixed the config" {
+		t.Errorf("outcome mismatch: %q", closed.Outcome)
+	}
+}
+
+func TestMCPCloseAllStatuses(t *testing.T) {
+	srv := testServer(t)
+	for _, status := range []string{"resolved", "mitigated", "abandoned", "needs-followup"} {
+		t.Run(status, func(t *testing.T) {
+			resp := toolCall(t, srv, "session_start", map[string]any{
+				"title": "test-" + status, "service": "svc", "environment": "dev",
+			})
+			var sess domain.Session
+			json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+			resp = toolCall(t, srv, "session_close", map[string]any{
+				"session_id": sess.ID, "status": status,
+			})
+			var closed domain.Session
+			json.Unmarshal([]byte(extractContent(t, resp)), &closed)
+			if string(closed.Status) != status {
+				t.Errorf("expected %s, got %s", status, closed.Status)
+			}
+		})
+	}
+}
+
+func TestMCPCloseAlreadyClosed(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	toolCall(t, srv, "session_close", map[string]any{
+		"session_id": sess.ID, "status": "resolved",
+	})
+
+	resp = toolCall(t, srv, "session_close", map[string]any{
+		"session_id": sess.ID, "status": "mitigated",
+	})
+	result := resp.Result.(map[string]any)
+	if isErr, ok := result["isError"]; !ok || isErr != true {
+		t.Error("expected isError=true when closing already-closed session")
+	}
+}
+
+func TestMCPCloseNotFound(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_close", map[string]any{
+		"session_id": "nonexistent", "status": "resolved",
+	})
+	result := resp.Result.(map[string]any)
+	if isErr, ok := result["isError"]; !ok || isErr != true {
+		t.Error("expected isError=true")
+	}
+}
+
+func TestMCPCloseTimelineAndState(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "investigation", "service": "api", "environment": "prod",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID, "kind": "observation", "summary": "found it",
+	})
+	toolCall(t, srv, "session_close", map[string]any{
+		"session_id": sess.ID, "status": "resolved", "outcome": "deployed fix",
+	})
+
+	// Verify timeline
+	resp = toolCall(t, srv, "session_get_timeline", map[string]any{"session_id": sess.ID})
+	var events []domain.TimelineEvent
+	json.Unmarshal([]byte(extractContent(t, resp)), &events)
+	lastEvent := events[len(events)-1]
+	if lastEvent.Kind != "session_closed" {
+		t.Errorf("last event: expected session_closed, got %s", lastEvent.Kind)
+	}
+	if !strings.Contains(lastEvent.Summary, "resolved") {
+		t.Errorf("expected resolved in summary, got %q", lastEvent.Summary)
+	}
+
+	// Verify state
+	resp = toolCall(t, srv, "session_get_state", map[string]any{"session_id": sess.ID})
+	var state domain.SessionState
+	json.Unmarshal([]byte(extractContent(t, resp)), &state)
+	if state.Session.Status != domain.SessionResolved {
+		t.Errorf("expected resolved, got %s", state.Session.Status)
+	}
+	if state.Session.Outcome != "deployed fix" {
+		t.Errorf("outcome mismatch: %q", state.Session.Outcome)
+	}
+}
+
 func TestMCPFullSliceFlow(t *testing.T) {
 	srv := testServer(t)
 

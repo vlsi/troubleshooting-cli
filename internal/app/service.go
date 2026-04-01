@@ -312,8 +312,14 @@ func (s *Service) RecommendNextSteps(sessionID string, n int) ([]domain.Recommen
 	return recs, nil
 }
 
-// GetTimeline returns timeline events for a session.
+// GetTimeline returns timeline events for a session, ordered by timestamp.
 func (s *Service) GetTimeline(sessionID string) ([]domain.TimelineEvent, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if _, err := s.store.GetSession(sessionID); err != nil {
+		return nil, fmt.Errorf("session not found: %w", err)
+	}
 	events, err := s.store.ListTimeline(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("list timeline: %w", err)
@@ -436,9 +442,24 @@ func (s *Service) GenerateSummary(sessionID, mode string) (string, error) {
 
 // CloseSession closes a session with a final status and outcome.
 func (s *Service) CloseSession(sessionID string, finalStatus domain.SessionStatus, outcome string) (domain.Session, error) {
+	if sessionID == "" {
+		return domain.Session{}, fmt.Errorf("session_id is required")
+	}
+	validStatuses := map[domain.SessionStatus]bool{
+		domain.SessionResolved:  true,
+		domain.SessionMitigated: true,
+		domain.SessionAbandoned: true,
+		domain.SessionFollowup:  true,
+	}
+	if !validStatuses[finalStatus] {
+		return domain.Session{}, fmt.Errorf("invalid final status %q; use: resolved, mitigated, abandoned, needs-followup", finalStatus)
+	}
 	sess, err := s.store.GetSession(sessionID)
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("session not found: %w", err)
+	}
+	if sess.Status != domain.SessionOpen {
+		return domain.Session{}, fmt.Errorf("session is already closed (status: %s)", sess.Status)
 	}
 	now := time.Now().UTC()
 	sess.Status = finalStatus

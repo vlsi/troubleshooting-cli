@@ -627,6 +627,80 @@ func TestCloseSession(t *testing.T) {
 	}
 }
 
+func TestCloseSessionAllStatuses(t *testing.T) {
+	svc := setup()
+	statuses := []domain.SessionStatus{
+		domain.SessionResolved, domain.SessionMitigated,
+		domain.SessionAbandoned, domain.SessionFollowup,
+	}
+	for _, status := range statuses {
+		t.Run(string(status), func(t *testing.T) {
+			sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+			closed, err := svc.CloseSession(sess.ID, status, "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if closed.Status != status {
+				t.Errorf("expected %s, got %s", status, closed.Status)
+			}
+		})
+	}
+}
+
+func TestCloseSessionValidation(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+
+	_, err := svc.CloseSession("", domain.SessionResolved, "")
+	if err == nil {
+		t.Error("expected error for empty session_id")
+	}
+	_, err = svc.CloseSession("nonexistent", domain.SessionResolved, "")
+	if err == nil {
+		t.Error("expected error for nonexistent session")
+	}
+	_, err = svc.CloseSession(sess.ID, domain.SessionStatus("bogus"), "")
+	if err == nil {
+		t.Error("expected error for invalid status")
+	}
+	_, err = svc.CloseSession(sess.ID, domain.SessionOpen, "")
+	if err == nil {
+		t.Error("expected error for 'open' as final status")
+	}
+}
+
+func TestCloseSessionAlreadyClosed(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.CloseSession(sess.ID, domain.SessionResolved, "done")
+	_, err := svc.CloseSession(sess.ID, domain.SessionMitigated, "retry")
+	if err == nil {
+		t.Error("expected error when closing already-closed session")
+	}
+	if !strings.Contains(err.Error(), "already closed") {
+		t.Errorf("expected 'already closed' message, got: %v", err)
+	}
+}
+
+func TestCloseSessionRecordsTimeline(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.CloseSession(sess.ID, domain.SessionResolved, "done")
+	timeline, _ := svc.GetTimeline(sess.ID)
+	found := false
+	for _, e := range timeline {
+		if e.Kind == "session_closed" {
+			found = true
+			if !strings.Contains(e.Summary, "resolved") {
+				t.Errorf("expected resolved in summary, got %q", e.Summary)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected session_closed timeline event")
+	}
+}
+
 func TestGetTimeline(t *testing.T) {
 	svc := setup()
 	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
@@ -638,5 +712,70 @@ func TestGetTimeline(t *testing.T) {
 	}
 	if len(timeline) < 2 {
 		t.Fatalf("expected at least 2 timeline events (session_started + finding_added), got %d", len(timeline))
+	}
+}
+
+func TestGetTimelineValidation(t *testing.T) {
+	svc := setup()
+	_, err := svc.GetTimeline("")
+	if err == nil {
+		t.Error("expected error for empty session_id")
+	}
+	_, err = svc.GetTimeline("nonexistent")
+	if err == nil {
+		t.Error("expected error for nonexistent session")
+	}
+}
+
+func TestGetTimelineOrdering(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	svc.AddFinding(sess.ID, "obs", "first finding", "", "", nil, nil)
+	svc.AddHypothesis(sess.ID, "a hypothesis", "", nil, nil)
+	svc.AddFinding(sess.ID, "obs", "second finding", "", "", nil, nil)
+
+	timeline, _ := svc.GetTimeline(sess.ID)
+	if len(timeline) < 4 {
+		t.Fatalf("expected at least 4 events, got %d", len(timeline))
+	}
+	if timeline[0].Kind != "session_started" {
+		t.Errorf("first event should be session_started, got %s", timeline[0].Kind)
+	}
+	if timeline[1].Kind != "finding_added" {
+		t.Errorf("second event should be finding_added, got %s", timeline[1].Kind)
+	}
+	if timeline[2].Kind != "hypothesis_added" {
+		t.Errorf("third event should be hypothesis_added, got %s", timeline[2].Kind)
+	}
+	if timeline[3].Kind != "finding_added" {
+		t.Errorf("fourth event should be finding_added, got %s", timeline[3].Kind)
+	}
+}
+
+func TestGetTimelineEventFields(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	timeline, _ := svc.GetTimeline(sess.ID)
+	if len(timeline) == 0 {
+		t.Fatal("expected at least one event")
+	}
+	e := timeline[0]
+	if e.ID == "" {
+		t.Error("event ID must not be empty")
+	}
+	if e.SessionID != sess.ID {
+		t.Error("session ID mismatch")
+	}
+	if e.Timestamp.IsZero() {
+		t.Error("timestamp must not be zero")
+	}
+	if e.Kind != "session_started" {
+		t.Errorf("expected session_started, got %s", e.Kind)
+	}
+	if e.Summary == "" {
+		t.Error("summary must not be empty")
+	}
+	if e.RefID == "" {
+		t.Error("ref_id should reference the session")
 	}
 }
