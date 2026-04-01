@@ -388,10 +388,14 @@ func closeCmd(dbPath *string) *cobra.Command {
 }
 
 func mcpCmd(dbPath *string) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "Run MCP stdio server",
 		Long:  "Start an MCP (Model Context Protocol) stdio server for AI agent integration.",
+		// Prevent cobra from writing anything to stdout — it would corrupt
+		// the JSON-RPC stream and hang the MCP client.
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			svc, cleanup, err := newService(*dbPath)
 			if err != nil {
@@ -402,4 +406,7 @@ func mcpCmd(dbPath *string) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.SetOut(os.Stderr)
+	cmd.SetErr(os.Stderr)
+	return cmd
 }
