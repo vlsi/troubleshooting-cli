@@ -43,6 +43,15 @@ func NewService(store Store, newID IDGenerator) *Service {
 
 // StartSession creates a new investigation session.
 func (s *Service) StartSession(title, service, env, incidentHint string, labels map[string]string) (domain.Session, error) {
+	if title == "" {
+		return domain.Session{}, fmt.Errorf("title is required")
+	}
+	if service == "" {
+		return domain.Session{}, fmt.Errorf("service is required")
+	}
+	if env == "" {
+		return domain.Session{}, fmt.Errorf("environment is required")
+	}
 	now := time.Now().UTC()
 	sess := domain.Session{
 		ID:           s.newID(),
@@ -81,6 +90,15 @@ func (s *Service) GetState(sessionID string) (domain.SessionState, error) {
 
 // AddFinding adds a finding to a session.
 func (s *Service) AddFinding(sessionID, kind, summary, details, importance string, tags []string, evidence []domain.Evidence) (domain.Finding, error) {
+	if sessionID == "" {
+		return domain.Finding{}, fmt.Errorf("session_id is required")
+	}
+	if summary == "" {
+		return domain.Finding{}, fmt.Errorf("summary is required")
+	}
+	if kind == "" {
+		kind = "observation"
+	}
 	if _, err := s.store.GetSession(sessionID); err != nil {
 		return domain.Finding{}, fmt.Errorf("session not found: %w", err)
 	}

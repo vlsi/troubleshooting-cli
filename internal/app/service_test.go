@@ -92,6 +92,53 @@ func setup() *Service {
 	return NewService(newMemStore(), testIDGen)
 }
 
+func TestStartSessionValidation(t *testing.T) {
+	svc := setup()
+	tests := []struct {
+		name    string
+		title   string
+		service string
+		env     string
+	}{
+		{"empty title", "", "svc", "dev"},
+		{"empty service", "title", "", "dev"},
+		{"empty env", "title", "svc", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := svc.StartSession(tc.title, tc.service, tc.env, "", nil)
+			if err == nil {
+				t.Error("expected validation error")
+			}
+		})
+	}
+}
+
+func TestAddFindingValidation(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	_, err := svc.AddFinding(sess.ID, "obs", "", "", "", nil, nil)
+	if err == nil {
+		t.Error("expected error for empty summary")
+	}
+	_, err = svc.AddFinding("", "obs", "summary", "", "", nil, nil)
+	if err == nil {
+		t.Error("expected error for empty session_id")
+	}
+}
+
+func TestAddFindingDefaultKind(t *testing.T) {
+	svc := setup()
+	sess, _ := svc.StartSession("test", "svc", "dev", "", nil)
+	f, err := svc.AddFinding(sess.ID, "", "something", "", "", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if f.Kind != "observation" {
+		t.Errorf("expected default kind 'observation', got %q", f.Kind)
+	}
+}
+
 func TestStartSession(t *testing.T) {
 	svc := setup()
 	sess, err := svc.StartSession("pod crash", "api-gateway", "prod", "INC-123", nil)
