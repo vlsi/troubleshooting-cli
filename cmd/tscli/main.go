@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vlsi/troubleshooting-cli/internal/app"
 	"github.com/vlsi/troubleshooting-cli/internal/domain"
+	"github.com/vlsi/troubleshooting-cli/internal/mcp"
 	"github.com/vlsi/troubleshooting-cli/internal/storage"
 )
 
@@ -49,6 +50,7 @@ func rootCmd() *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: ~/.troubleshooting/sessions.db)")
 	root.AddCommand(sessionCmd(&dbPath))
+	root.AddCommand(mcpCmd(&dbPath))
 	return root
 }
 
@@ -383,4 +385,21 @@ func closeCmd(dbPath *string) *cobra.Command {
 	cmd.MarkFlagRequired("session")
 	cmd.MarkFlagRequired("status")
 	return cmd
+}
+
+func mcpCmd(dbPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "mcp",
+		Short: "Run MCP stdio server",
+		Long:  "Start an MCP (Model Context Protocol) stdio server for AI agent integration.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, cleanup, err := newService(*dbPath)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			mcp.NewServer(svc).Run(os.Stdin, os.Stdout)
+			return nil
+		},
+	}
 }

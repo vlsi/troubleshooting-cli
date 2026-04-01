@@ -1,4 +1,4 @@
-package main
+package mcp
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 	"github.com/vlsi/troubleshooting-cli/internal/storage"
 )
 
-func testServer(t *testing.T) *mcpServer {
+func testServer(t *testing.T) *Server {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	store, err := storage.NewSQLiteStore(dbPath)
@@ -26,13 +26,13 @@ func testServer(t *testing.T) *mcpServer {
 		counter++
 		return fmt.Sprintf("test-id-%d", counter)
 	})
-	return &mcpServer{svc: svc}
+	return &Server{svc: svc}
 }
 
-func call(t *testing.T, srv *mcpServer, method string, id any, params any) jsonrpcResponse {
+func call(t *testing.T, srv *Server, method string, id any, params any) Response {
 	t.Helper()
 	paramsBytes, _ := json.Marshal(params)
-	req := jsonrpcRequest{
+	req := Request{
 		JSONRPC: "2.0",
 		ID:      id,
 		Method:  method,
@@ -41,9 +41,9 @@ func call(t *testing.T, srv *mcpServer, method string, id any, params any) jsonr
 	line, _ := json.Marshal(req)
 	in := bytes.NewReader(append(line, '\n'))
 	out := new(bytes.Buffer)
-	srv.run(in, out)
+	srv.Run(in, out)
 
-	var resp jsonrpcResponse
+	var resp Response
 	if out.Len() == 0 {
 		return resp
 	}
@@ -53,7 +53,7 @@ func call(t *testing.T, srv *mcpServer, method string, id any, params any) jsonr
 	return resp
 }
 
-func toolCall(t *testing.T, srv *mcpServer, toolName string, args any) jsonrpcResponse {
+func toolCall(t *testing.T, srv *Server, toolName string, args any) Response {
 	t.Helper()
 	return call(t, srv, "tools/call", 1, map[string]any{
 		"name":      toolName,
@@ -61,7 +61,7 @@ func toolCall(t *testing.T, srv *mcpServer, toolName string, args any) jsonrpcRe
 	})
 }
 
-func extractContent(t *testing.T, resp jsonrpcResponse) string {
+func extractContent(t *testing.T, resp Response) string {
 	t.Helper()
 	result, ok := resp.Result.(map[string]any)
 	if !ok {
