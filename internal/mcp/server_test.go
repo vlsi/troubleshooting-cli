@@ -224,6 +224,57 @@ func TestMCPAddFinding(t *testing.T) {
 	}
 }
 
+func TestMCPAddFindingStringEvidence(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// LLM sends evidence as plain strings instead of objects
+	resp = toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID,
+		"kind":       "observation",
+		"summary":    "replica stuck",
+		"evidence": []string{
+			"patronictl list shows node2 State=starting",
+			"Logs show: psycopg2.ProgrammingError",
+		},
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var finding domain.Finding
+	json.Unmarshal([]byte(extractContent(t, resp)), &finding)
+	if len(finding.EvidenceRefs) != 2 {
+		t.Fatalf("expected 2 evidence refs, got %d", len(finding.EvidenceRefs))
+	}
+	if finding.EvidenceRefs[0].Type != "observation" {
+		t.Errorf("expected type 'observation' for string evidence, got %q", finding.EvidenceRefs[0].Type)
+	}
+	if finding.EvidenceRefs[0].Pointer != "patronictl list shows node2 State=starting" {
+		t.Errorf("pointer mismatch: %q", finding.EvidenceRefs[0].Pointer)
+	}
+
+	// Verify structured evidence still works
+	resp = toolCall(t, srv, "session_add_finding", map[string]any{
+		"session_id": sess.ID,
+		"kind":       "error",
+		"summary":    "connection error",
+		"evidence": []map[string]any{
+			{"type": "log", "pointer": "/var/log/app.log", "snippet": "connection refused"},
+		},
+	})
+	if resp.Error != nil {
+		t.Fatalf("structured evidence failed: %s", resp.Error.Message)
+	}
+	json.Unmarshal([]byte(extractContent(t, resp)), &finding)
+	if len(finding.EvidenceRefs) != 1 || finding.EvidenceRefs[0].Type != "log" {
+		t.Error("structured evidence should still parse correctly")
+	}
+}
+
 func TestMCPAddFindingBadSession(t *testing.T) {
 	srv := testServer(t)
 	resp := toolCall(t, srv, "session_add_finding", map[string]any{
@@ -283,6 +334,58 @@ func TestMCPAddHypothesisBadSession(t *testing.T) {
 	result := resp.Result.(map[string]any)
 	if isErr, ok := result["isError"]; !ok || isErr != true {
 		t.Error("expected isError=true")
+	}
+}
+
+func TestMCPConfidenceAsString(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	// Add hypothesis with confidence as string (LLM sends "0.7" instead of 0.7)
+	resp = toolCall(t, srv, "session_add_hypothesis", map[string]any{
+		"session_id": sess.ID,
+		"statement":  "test string confidence",
+		"confidence": "0.7",
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var h domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &h)
+	if h.Confidence == nil || *h.Confidence != 0.7 {
+		t.Errorf("expected confidence 0.7, got %v", h.Confidence)
+	}
+
+	// Update hypothesis with confidence as string
+	resp = toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id":         h.ID,
+		"status":     "supported",
+		"confidence": "0.95",
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	var updated domain.Hypothesis
+	json.Unmarshal([]byte(extractContent(t, resp)), &updated)
+	if updated.Confidence == nil || *updated.Confidence != 0.95 {
+		t.Errorf("expected confidence 0.95, got %v", updated.Confidence)
+	}
+
+	// Verify numeric confidence still works
+	resp = toolCall(t, srv, "session_update_hypothesis", map[string]any{
+		"id":         h.ID,
+		"confidence": 0.85,
+	})
+	if resp.Error != nil {
+		t.Fatalf("error: %s", resp.Error.Message)
+	}
+	json.Unmarshal([]byte(extractContent(t, resp)), &updated)
+	if updated.Confidence == nil || *updated.Confidence != 0.85 {
+		t.Errorf("expected confidence 0.85, got %v", updated.Confidence)
 	}
 }
 
@@ -361,6 +464,51 @@ func TestMCPUpdateHypothesisContradicting(t *testing.T) {
 	}
 	if len(updated.ContradictingFindingIDs) != 2 {
 		t.Errorf("expected 2 contradicting, got %d", len(updated.ContradictingFindingIDs))
+	}
+}
+
+func TestMCPUpdateHypothesisStatusSynonyms(t *testing.T) {
+	srv := testServer(t)
+	resp := toolCall(t, srv, "session_start", map[string]any{
+		"title": "test", "service": "svc", "environment": "dev",
+	})
+	var sess domain.Session
+	json.Unmarshal([]byte(extractContent(t, resp)), &sess)
+
+	tests := []struct {
+		synonym  string
+		expected domain.HypothesisStatus
+	}{
+		{"refuted", domain.HypothesisRejected},
+		{"disproven", domain.HypothesisRejected},
+		{"verified", domain.HypothesisConfirmed},
+		{"likely", domain.HypothesisSupported},
+		{"unlikely", domain.HypothesisContradicted},
+		{"pending", domain.HypothesisOpen},
+	}
+	for _, tc := range tests {
+		t.Run(tc.synonym, func(t *testing.T) {
+			resp := toolCall(t, srv, "session_add_hypothesis", map[string]any{
+				"session_id": sess.ID, "statement": "test " + tc.synonym,
+			})
+			var h domain.Hypothesis
+			json.Unmarshal([]byte(extractContent(t, resp)), &h)
+
+			resp = toolCall(t, srv, "session_update_hypothesis", map[string]any{
+				"id": h.ID, "status": tc.synonym,
+			})
+			result, ok := resp.Result.(map[string]any)
+			if ok {
+				if isErr, _ := result["isError"]; isErr == true {
+					t.Fatalf("synonym %q rejected: %v", tc.synonym, result)
+				}
+			}
+			var updated domain.Hypothesis
+			json.Unmarshal([]byte(extractContent(t, resp)), &updated)
+			if updated.Status != tc.expected {
+				t.Errorf("synonym %q: expected %s, got %s", tc.synonym, tc.expected, updated.Status)
+			}
+		})
 	}
 }
 
