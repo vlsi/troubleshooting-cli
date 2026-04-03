@@ -1,0 +1,13 @@
+name: vlsi/troubleshooting-cli
+version: 1.0.0
+description: Local-first troubleshooting session manager for AI-assisted investigations
+author: Vladimir Sitnikov
+license: Apache-2.0
+type: skill
+dependencies:
+  mcp:
+    - name: troubleshooting
+      registry: false
+      transport: stdio
+      command: tscli
+      args: ["mcp"]

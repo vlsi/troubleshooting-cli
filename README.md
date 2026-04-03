@@ -6,8 +6,16 @@ Preserves findings, hypotheses, evidence, and timeline across terminal sessions,
 
 ## Install
 
+To install `tscli` to `~/go/bin/tscli`, execute
+
 ```sh
 go install github.com/vlsi/troubleshooting-cli/cmd/tscli@latest
+```
+
+To install `tscli` to the current directory, execute
+
+```sh
+GOBIN="$(pwd)" go install github.com/vlsi/troubleshooting-cli/cmd/tscli@latest
 ```
 
 Single binary, no external dependencies. Data stored in `~/.troubleshooting/sessions.db` (SQLite).
