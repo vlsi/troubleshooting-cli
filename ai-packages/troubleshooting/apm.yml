@@ -9,5 +9,5 @@ dependencies:
     - name: troubleshooting
       registry: false
       transport: stdio
-      command: tscli
+      command: ./tscli
       args: ["mcp"]
